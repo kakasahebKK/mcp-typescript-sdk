@@ -21,6 +21,7 @@ import {
   RequestId,
   Result,
   ServerCapabilities,
+  RequestMeta,
 } from "../types.js";
 import { Transport, TransportSendOptions } from "./transport.js";
 import { AuthInfo } from "../server/auth/types.js";
@@ -114,6 +115,17 @@ export type RequestHandlerExtra<SendRequestT extends Request,
      * The session ID from the transport, if available.
      */
     sessionId?: string;
+
+    /**
+     * Metadata from the original request.
+     */
+    _meta?: RequestMeta;
+
+    /**
+     * The JSON-RPC ID of the request being handled.
+     * This can be useful for tracking or logging purposes.
+     */
+    requestId: RequestId;
 
     /**
      * Sends a notification that relates to the current request being handled.
@@ -355,12 +367,14 @@ export abstract class Protocol<
     const fullExtra: RequestHandlerExtra<SendRequestT, SendNotificationT> = {
       signal: abortController.signal,
       sessionId: this._transport?.sessionId,
+      _meta: request.params?._meta,
       sendNotification:
         (notification) =>
           this.notification(notification, { relatedRequestId: request.id }),
       sendRequest: (r, resultSchema, options?) =>
         this.request(r, resultSchema, { ...options, relatedRequestId: request.id }),
       authInfo: extra?.authInfo,
+      requestId: request.id,
     };
 
     // Starting with Promise.resolve() puts any synchronous errors into the monad as well.

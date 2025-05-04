@@ -1,12 +1,24 @@
 import { StreamableHTTPClientTransport, StreamableHTTPReconnectionOptions } from "./streamableHttp.js";
+import { OAuthClientProvider, UnauthorizedError } from "./auth.js";
 import { JSONRPCMessage } from "../types.js";
 
 
 describe("StreamableHTTPClientTransport", () => {
   let transport: StreamableHTTPClientTransport;
+  let mockAuthProvider: jest.Mocked<OAuthClientProvider>;
 
   beforeEach(() => {
-    transport = new StreamableHTTPClientTransport(new URL("http://localhost:1234/mcp"));
+    mockAuthProvider = {
+      get redirectUrl() { return "http://localhost/callback"; },
+      get clientMetadata() { return { redirect_uris: ["http://localhost/callback"] }; },
+      clientInformation: jest.fn(() => ({ client_id: "test-client-id", client_secret: "test-client-secret" })),
+      tokens: jest.fn(),
+      saveTokens: jest.fn(),
+      redirectToAuthorization: jest.fn(),
+      saveCodeVerifier: jest.fn(),
+      codeVerifier: jest.fn(),
+    };
+    transport = new StreamableHTTPClientTransport(new URL("http://localhost:1234/mcp"), { authProvider: mockAuthProvider });
     jest.spyOn(global, "fetch");
   });
 
@@ -99,6 +111,77 @@ describe("StreamableHTTPClientTransport", () => {
     const lastCall = calls[calls.length - 1];
     expect(lastCall[1].headers).toBeDefined();
     expect(lastCall[1].headers.get("mcp-session-id")).toBe("test-session-id");
+  });
+
+  it("should terminate session with DELETE request", async () => {
+    // First, simulate getting a session ID
+    const message: JSONRPCMessage = {
+      jsonrpc: "2.0",
+      method: "initialize",
+      params: {
+        clientInfo: { name: "test-client", version: "1.0" },
+        protocolVersion: "2025-03-26"
+      },
+      id: "init-id"
+    };
+
+    (global.fetch as jest.Mock).mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      headers: new Headers({ "content-type": "text/event-stream", "mcp-session-id": "test-session-id" }),
+    });
+
+    await transport.send(message);
+    expect(transport.sessionId).toBe("test-session-id");
+
+    // Now terminate the session
+    (global.fetch as jest.Mock).mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      headers: new Headers()
+    });
+
+    await transport.terminateSession();
+
+    // Verify the DELETE request was sent with the session ID
+    const calls = (global.fetch as jest.Mock).mock.calls;
+    const lastCall = calls[calls.length - 1];
+    expect(lastCall[1].method).toBe("DELETE");
+    expect(lastCall[1].headers.get("mcp-session-id")).toBe("test-session-id");
+
+    // The session ID should be cleared after successful termination
+    expect(transport.sessionId).toBeUndefined();
+  });
+
+  it("should handle 405 response when server doesn't support session termination", async () => {
+    // First, simulate getting a session ID
+    const message: JSONRPCMessage = {
+      jsonrpc: "2.0",
+      method: "initialize",
+      params: {
+        clientInfo: { name: "test-client", version: "1.0" },
+        protocolVersion: "2025-03-26"
+      },
+      id: "init-id"
+    };
+
+    (global.fetch as jest.Mock).mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      headers: new Headers({ "content-type": "text/event-stream", "mcp-session-id": "test-session-id" }),
+    });
+
+    await transport.send(message);
+
+    // Now terminate the session, but server responds with 405
+    (global.fetch as jest.Mock).mockResolvedValueOnce({
+      ok: false,
+      status: 405,
+      statusText: "Method Not Allowed",
+      headers: new Headers()
+    });
+
+    await expect(transport.terminateSession()).resolves.not.toThrow();
   });
 
   it("should handle 404 response when session expires", async () => {
@@ -426,4 +509,27 @@ describe("StreamableHTTPClientTransport", () => {
     expect(getDelay(10)).toBe(5000);
   });
 
+  it("attempts auth flow on 401 during POST request", async () => {
+    const message: JSONRPCMessage = {
+      jsonrpc: "2.0",
+      method: "test",
+      params: {},
+      id: "test-id"
+    };
+
+    (global.fetch as jest.Mock)
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 401,
+        statusText: "Unauthorized",
+        headers: new Headers()
+      })
+      .mockResolvedValue({
+        ok: false,
+        status: 404
+      });
+
+    await expect(transport.send(message)).rejects.toThrow(UnauthorizedError);
+    expect(mockAuthProvider.redirectToAuthorization.mock.calls).toHaveLength(1);
+  });
 });
